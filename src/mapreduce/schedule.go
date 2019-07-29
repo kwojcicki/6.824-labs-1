@@ -2,7 +2,6 @@ package mapreduce
 
 import (
 	"fmt"
-	"sync"
 )
 
 //
@@ -27,33 +26,60 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 	}
 
 	fmt.Printf("Schedule: %v %v tasks (%d I/Os)\n", ntasks, phase, n_other)
-	var wg sync.WaitGroup
 	// All ntasks tasks have to be scheduled on workers. Once all tasks
 	// have completed successfully, schedule() should return.
 	//
 	// Your code here (Part III, Part IV).
 	//
 
-	taskIndex := 0
-	for worker := range registerChan {
-		wg.Add(1)
-		go func(worker string, index int) {
-			switch phase {
-			case mapPhase:
-				call(worker, "Worker.DoTask", DoTaskArgs{JobName: jobName, Phase: phase, TaskNumber: index, NumOtherPhase: n_other, File: mapFiles[index]}, nil)
-			case reducePhase:
-				call(worker, "Worker.DoTask", DoTaskArgs{JobName: jobName, Phase: phase, TaskNumber: index, NumOtherPhase: n_other}, nil)
-			}
-			wg.Done()
+	finishJob := make(chan bool, ntasks)
+	jobQueue := make(chan int)
+
+	go func() {
+		for i := 0; i < ntasks; i++ {
+			jobQueue <- i
+		}
+	}()
+
+	// worker goroutine once finished either queue worker for new job or give task to anotehr worker
+	work := func(worker string, index int) {
+		var resp bool
+		switch phase {
+		case mapPhase:
+			resp = call(worker, "Worker.DoTask", DoTaskArgs{JobName: jobName, Phase: phase, TaskNumber: index, NumOtherPhase: n_other, File: mapFiles[index]}, nil)
+		case reducePhase:
+			resp = call(worker, "Worker.DoTask", DoTaskArgs{JobName: jobName, Phase: phase, TaskNumber: index, NumOtherPhase: n_other}, nil)
+		}
+
+		if resp {
+			finishJob <- true
 			registerChan <- worker
-		}(worker, taskIndex)
-		taskIndex++
-		//fmt.Print("Scheduled task", taskIndex, "total tasks", ntasks, "\n")
-		if taskIndex == ntasks {
-			break
+		} else {
+			jobQueue <- index
 		}
 	}
-	fmt.Print("Waiting")
-	wg.Wait()
+
+	end := false
+	jobFinished := 0
+	for !end {
+		select {
+		case job := <-jobQueue:
+			worker := <-registerChan
+			go work(worker, job)
+		case worker := <-registerChan:
+			select {
+			case job := <-jobQueue:
+				go work(worker, job)
+			case finished := <-finishJob:
+				finishJob <- finished
+			}
+		case <-finishJob:
+			jobFinished++
+			if jobFinished == ntasks {
+				end = true
+			}
+		}
+	}
+
 	fmt.Printf("Schedule: %v done\n", phase)
 }
